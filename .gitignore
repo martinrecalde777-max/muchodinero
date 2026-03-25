@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+trade_journal.csv
+.env
+*.egg-info/
+dist/
+build/
