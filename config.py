@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 
 @dataclass
 class AccountConfig:
-    starting_capital: float = 100_000.0
-    risk_per_trade: float = 0.02        # 2% máximo por operación
-    max_positions: int = 6
-    max_sector_exposure: float = 0.20   # 20% máximo por sector
-    weekly_max_loss: float = 0.05       # 5% pérdida máxima semanal
+    starting_capital: float = 5_000.0
+    leverage: int = 200                 # Apalancamiento 1:200
+    buying_power: float = 1_000_000.0   # 5,000 × 200
+    risk_per_trade: float = 0.01        # 1% máximo por operación ($50 con $5k)
+    max_positions: int = 3              # Menos posiciones con cuenta pequeña
+    max_sector_exposure: float = 0.30   # 30% máximo por sector
+    weekly_max_loss: float = 0.03       # 3% pérdida máxima semanal ($150)
 
 
 @dataclass
@@ -19,9 +21,9 @@ class ScannerConfig:
     custom_tickers: list = field(default_factory=list)
     min_avg_volume: int = 500_000
     rsi_period: int = 14
-    rsi_oversold: float = 30.0
-    rsi_overbought: float = 55.0
-    sma_period: int = 50
+    rsi_oversold: float = 40.0       # RSI < 40 (más señales realistas)
+    rsi_overbought: float = 60.0
+    sma_period: int = 50             # SMA50 (tendencia de largo plazo)
     lookback_days: int = 120
     macd_fast: int = 12
     macd_slow: int = 26

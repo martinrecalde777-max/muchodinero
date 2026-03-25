@@ -4,44 +4,97 @@ Scanner de mercado para identificar oportunidades de trading.
 Estrategias:
 1. Mean Reversion: RSI oversold + precio sobre SMA50 + MACD girando
 2. Momentum Breakout: ruptura de máximo de 20 días con volumen alto
+
+Indicadores calculados manualmente con pandas/numpy (sin dependencia de 'ta').
 """
 import warnings
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator, MACD
-from ta.volatility import AverageTrueRange
 
 from config import ScannerConfig, get_sp500_tickers
 
 warnings.filterwarnings("ignore")
 
 
+# ── Indicadores técnicos ─────────────────────────────────────────────
+
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(window=period).mean()
+
+
+def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return histogram
+
+
+def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+
+# ── Descarga de datos ─────────────────────────────────────────────────
+
 def fetch_data(tickers: list[str], period: str = "6mo") -> dict[str, pd.DataFrame]:
-    """Descarga datos OHLCV para una lista de tickers."""
+    """Descarga datos OHLCV. Usa yfinance si disponible, sino datos simulados."""
     result = {}
-    # Procesar en lotes de 50 para evitar throttling
-    batch_size = 50
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i : i + batch_size]
-        try:
-            data = yf.download(batch, period=period, group_by="ticker", progress=False)
-            if len(batch) == 1:
-                ticker = batch[0]
-                if not data.empty:
-                    result[ticker] = data.copy()
-            else:
-                for ticker in batch:
-                    try:
-                        df = data[ticker].dropna(how="all")
-                        if not df.empty and len(df) > 20:
-                            result[ticker] = df.copy()
-                    except (KeyError, TypeError):
-                        continue
-        except Exception:
-            continue
-    return result
+
+    # Intentar yfinance primero
+    try:
+        import io, sys
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        test = yf.download(tickers[0], period="5d", progress=False)
+        sys.stderr = old_stderr
+        if not test.empty:
+            batch_size = 50
+            for i in range(0, len(tickers), batch_size):
+                batch = tickers[i : i + batch_size]
+                try:
+                    data = yf.download(batch, period=period, group_by="ticker", progress=False)
+                    if len(batch) == 1:
+                        ticker = batch[0]
+                        if not data.empty:
+                            result[ticker] = data.copy()
+                    else:
+                        for ticker in batch:
+                            try:
+                                df = data[ticker].dropna(how="all")
+                                if not df.empty and len(df) > 20:
+                                    result[ticker] = df.copy()
+                            except (KeyError, TypeError):
+                                continue
+                except Exception:
+                    continue
+            if result:
+                return result
+    except Exception:
+        sys.stderr = old_stderr
+
+    # Fallback: datos simulados realistas
+    print("  [Usando datos simulados - yfinance no disponible]")
+    from market_data import fetch_simulated_data
+    return fetch_simulated_data(tickers)
+
 
 
 def add_indicators(df: pd.DataFrame, config: ScannerConfig = None) -> pd.DataFrame:
@@ -54,45 +107,21 @@ def add_indicators(df: pd.DataFrame, config: ScannerConfig = None) -> pd.DataFra
     low = df["Low"].squeeze() if isinstance(df["Low"], pd.DataFrame) else df["Low"]
     volume = df["Volume"].squeeze() if isinstance(df["Volume"], pd.DataFrame) else df["Volume"]
 
-    # RSI
-    rsi = RSIIndicator(close=close, window=config.rsi_period)
-    df["RSI"] = rsi.rsi()
-
-    # SMA
-    sma = SMAIndicator(close=close, window=config.sma_period)
-    df["SMA50"] = sma.sma_indicator()
-
-    # MACD
-    macd = MACD(
-        close=close,
-        window_slow=config.macd_slow,
-        window_fast=config.macd_fast,
-        window_sign=config.macd_signal,
-    )
-    df["MACD_hist"] = macd.macd_diff()
-
-    # ATR
-    atr = AverageTrueRange(high=high, low=low, close=close, window=config.atr_period)
-    df["ATR"] = atr.average_true_range()
-
-    # Volumen promedio 20 días
+    df["RSI"] = calc_rsi(close, config.rsi_period)
+    df["SMA50"] = calc_sma(close, config.sma_period)
+    df["MACD_hist"] = calc_macd(close, config.macd_fast, config.macd_slow, config.macd_signal)
+    df["ATR"] = calc_atr(high, low, close, config.atr_period)
     df["Avg_Volume"] = volume.rolling(window=20).mean()
-
-    # Máximo de N días (para breakout)
     df["High_20"] = high.rolling(window=config.breakout_period).max()
 
     return df
 
 
+# ── Estrategias de scan ───────────────────────────────────────────────
+
 def scan_mean_reversion(
     ticker: str, df: pd.DataFrame, config: ScannerConfig = None
 ) -> dict | None:
-    """
-    Señal de mean reversion:
-    - RSI < 30 (oversold)
-    - Precio por encima de SMA50 (tendencia alcista)
-    - MACD histograma girando positivo (momentum cambiando)
-    """
     config = config or ScannerConfig()
     if len(df) < 3:
         return None
@@ -109,22 +138,16 @@ def scan_mean_reversion(
 
     if None in (rsi, sma50, macd_hist, macd_hist_prev):
         return None
-
-    # Filtro de volumen mínimo
     if avg_vol < config.min_avg_volume:
         return None
 
-    # Condiciones de entrada
     rsi_oversold = rsi < config.rsi_oversold
     above_sma = close > sma50
-    macd_turning = macd_hist > macd_hist_prev  # histograma mejorando
+    macd_turning = macd_hist > macd_hist_prev
 
     if rsi_oversold and above_sma and macd_turning:
-        # Stop: mínimo de las últimas 5 barras
         recent_low = float(df["Low"].iloc[-5:].min())
         stop_price = min(recent_low, close * (1 - config.max_stop_pct))
-
-        # Target: 2:1 ratio
         risk = close - stop_price
         target_price = close + 2 * risk
 
@@ -143,11 +166,6 @@ def scan_mean_reversion(
 def scan_momentum_breakout(
     ticker: str, df: pd.DataFrame, config: ScannerConfig = None
 ) -> dict | None:
-    """
-    Señal de momentum breakout:
-    - Precio rompe máximo de 20 días
-    - Volumen por encima de 1.5x el promedio
-    """
     config = config or ScannerConfig()
     if len(df) < 3:
         return None
@@ -161,29 +179,20 @@ def scan_momentum_breakout(
 
     if high_20 is None or atr is None:
         return None
-
     if avg_vol < config.min_avg_volume:
         return None
 
     current_volume = float(last["Volume"])
     volume_ratio = current_volume / avg_vol if avg_vol > 0 else 0
 
-    # Condiciones de entrada
     breakout = close >= high_20
     high_volume = volume_ratio >= config.volume_multiplier
 
     if breakout and high_volume:
-        # Stop: mínimo de la barra de ruptura o 2 ATR
-        stop_price = max(
-            float(last["Low"]),
-            close - 2 * atr,
-        )
-        # Limitar stop al máximo permitido
+        stop_price = max(float(last["Low"]), close - 2 * atr)
         stop_price = max(stop_price, close * (1 - config.max_stop_pct))
-
         risk = close - stop_price
         target_price = close + 2 * risk
-
         rsi = float(last["RSI"]) if pd.notna(last["RSI"]) else 0
 
         return {
@@ -202,7 +211,6 @@ def run_scan(config: ScannerConfig = None) -> pd.DataFrame:
     """Ejecuta el scan completo y retorna señales encontradas."""
     config = config or ScannerConfig()
 
-    # Obtener universo de tickers
     if config.universe == "custom" and config.custom_tickers:
         tickers = config.custom_tickers
     else:
@@ -217,12 +225,10 @@ def run_scan(config: ScannerConfig = None) -> pd.DataFrame:
         try:
             df_ind = add_indicators(df, config)
 
-            # Mean Reversion
             signal = scan_mean_reversion(ticker, df_ind, config)
             if signal:
                 signals.append(signal)
 
-            # Momentum Breakout
             signal = scan_momentum_breakout(ticker, df_ind, config)
             if signal:
                 signals.append(signal)
